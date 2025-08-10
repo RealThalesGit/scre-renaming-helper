@@ -1,3 +1,4 @@
+# Made with ChatGPT help, PT-BR: Feito com ajuda do ChatGPT
 import re
 import hashlib
 import threading
@@ -409,3 +410,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
