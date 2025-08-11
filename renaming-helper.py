@@ -1,22 +1,23 @@
 # Made with ChatGPT help, PT-BR: Feito com ajuda do ChatGPT
-import re
-import hashlib
-import threading
-import time
-import json
-
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTableWidget,
-    QTableWidgetItem, QMessageBox, QProgressBar,
-    QSlider, QFileDialog, QApplication
-)
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
-
 import ida_kernwin
 import ida_name
 import ida_funcs
 import ida_bytes
+import idaapi
+import threading
+import hashlib
+import time
+import json
+import re
+import binascii
+
+from PyQt5.QtWidgets import (
+    QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QTableWidget, QTableWidgetItem,
+    QMessageBox, QProgressBar, QSlider, QApplication, QFileDialog, QTextEdit, QWidget, QSplitter
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
+
+NULLSUB_PATTERN = re.compile(r"^(nullsub|voidsub|sub)_\d+$", re.IGNORECASE)
 
 class WorkerSignals(QObject):
     progress = pyqtSignal(int)
@@ -24,32 +25,37 @@ class WorkerSignals(QObject):
     finished = pyqtSignal()
     error = pyqtSignal(str)
     result = pyqtSignal(list)
+    log = pyqtSignal(str)
 
 class MatchWorker(threading.Thread):
-    def __init__(self, base_funcs, target_funcs, signals, threshold, prefix_len=8):
+    def __init__(self, base_funcs, target_funcs, signals, threshold):
         super().__init__()
         self.base_funcs = base_funcs
         self.target_funcs = target_funcs
         self.signals = signals
-        self._is_running = True
         self.threshold = threshold
-        self.prefix_len = prefix_len
+        self._is_running = True
 
     def stop(self):
         self._is_running = False
 
-    def similarity_score(self, hash1: str, hash2: str) -> float:
-        if not hash1 or not hash2:
+    def similarity_score(self, b1: bytes, b2: bytes) -> float:
+        if not b1 or not b2:
             return 0.0
-        length = min(len(hash1), len(hash2))
-        matches = sum(1 for i in range(length) if hash1[i] == hash2[i])
+        length = min(len(b1), len(b2))
+        if length == 0:
+            return 0.0
+        matches = 0
+        for i in range(length):
+            if b1[i] == b2[i]:
+                matches += 1
         return matches / length
 
     def build_buckets(self, funcs):
         buckets = {}
         for addr, data in funcs.items():
-            h = data["hash"]
-            key = h[:self.prefix_len] if h and len(h) >= self.prefix_len else ""
+            size = len(data["bytes"]) if "bytes" in data else 0
+            key = size // 10  # bucket por faixa de tamanho de 10 bytes
             buckets.setdefault(key, []).append((addr, data))
         return buckets
 
@@ -58,20 +64,25 @@ class MatchWorker(threading.Thread):
             matches = []
             total = len(self.base_funcs)
             target_buckets = self.build_buckets(self.target_funcs)
+
             for i, (b_addr, b_data) in enumerate(self.base_funcs.items()):
                 if not self._is_running:
-                    self.signals.status.emit("Canceled by user")
+                    self.signals.status.emit("Cancelled by user")
+                    self.signals.log.emit("Matching cancelled by user.")
                     break
 
                 best_score = 0.0
                 best_t_addr = None
                 best_t_name = None
 
-                prefix = b_data["hash"][:self.prefix_len] if b_data["hash"] and len(b_data["hash"]) >= self.prefix_len else ""
-                candidates = target_buckets.get(prefix, [])
+                b_size = len(b_data["bytes"])
+                bucket_key = b_size // 10
+                candidates = []
+                for k in (bucket_key - 1, bucket_key, bucket_key + 1):
+                    candidates.extend(target_buckets.get(k, []))
 
                 for t_addr, t_data in candidates:
-                    score = self.similarity_score(b_data["hash"], t_data["hash"])
+                    score = self.similarity_score(b_data["bytes"], t_data["bytes"])
                     if score > best_score:
                         best_score = score
                         best_t_addr = t_addr
@@ -79,229 +90,201 @@ class MatchWorker(threading.Thread):
 
                 if best_score >= self.threshold:
                     matches.append((b_addr, b_data["name"], best_t_addr, best_t_name, best_score * 100))
+                    self.signals.log.emit(f"Match found: Base {b_data['name']} @0x{b_addr:x} -> Target {best_t_name} @0x{best_t_addr:x} ({best_score*100:.2f}%)")
                 else:
-                    matches.append((b_addr, b_data["name"], "-", "-", 0.0))
+                    matches.append((b_addr, b_data["name"], None, None, 0.0))
+                    self.signals.log.emit(f"No good match for base function {b_data['name']} @0x{b_addr:x}")
 
                 if i % 10 == 0:
                     self.signals.progress.emit(i)
-                    self.signals.status.emit(f"Processing function {i}/{total}")
+                    self.signals.status.emit(f"Matching {i}/{total} functions...")
 
                 time.sleep(0.001)
 
             self.signals.progress.emit(total)
             self.signals.status.emit("Matching finished")
+            self.signals.log.emit("Matching process finished.")
             self.signals.result.emit(matches)
+
         except Exception as e:
             self.signals.error.emit(str(e))
+            self.signals.log.emit(f"Error during matching: {e}")
         finally:
             self.signals.finished.emit()
 
-class SCREForm(ida_kernwin.PluginForm):
+class RenamingPlugin(ida_kernwin.PluginForm):
     def OnCreate(self, form):
         self.parent = self.FormToPyQtWidget(form)
+        self._setup_ui()
+        self._connect_signals()
 
-        self.layout = QVBoxLayout()
-        self.parent.setLayout(self.layout)
+        self.base_funcs = {}
+        self.target_funcs = {}
+        self.matches = []
+        self.worker = None
 
-        self.label_base = QLabel("Base: Current IDA functions")
-        self.label_target = QLabel("Target: No target JSON loaded")
+        self.signals = WorkerSignals()
+
+        self.signals.progress.connect(self._on_progress)
+        self.signals.status.connect(self._on_status)
+        self.signals.finished.connect(self._on_finished)
+        self.signals.error.connect(self._on_error)
+        self.signals.result.connect(self._on_result)
+        self.signals.log.connect(self._on_log)
+
+        self.load_base_functions()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout()
+        self.parent.setLayout(layout)
+
+        splitter = QSplitter(Qt.Vertical)
+        layout.addWidget(splitter)
+
+        top_widget = QWidget()
+        top_layout = QVBoxLayout()
+        top_widget.setLayout(top_layout)
+
+        self.label_base = QLabel("Base: Not loaded")
+        self.label_target = QLabel("Target: Not loaded")
         self.status_label = QLabel("Status: Idle")
 
-        # Buttons
-        self.btn_export_base_json = QPushButton("Export Base Functions to JSON")
-        self.btn_load_target_json = QPushButton("Load Target JSON")
+        self.btn_load_json = QPushButton("Load Target JSON")
         self.btn_run_match = QPushButton("Run Matching")
-        self.btn_apply_rename = QPushButton("Apply Rename in Base")
+        self.btn_apply_rename = QPushButton("Apply Renaming")
         self.btn_cancel = QPushButton("Cancel Matching")
-        self.btn_copy_results = QPushButton("Copy Results to Clipboard")
+        self.btn_copy_results = QPushButton("Copy Match Results")
 
-        self.btn_cancel.setEnabled(False)
         self.btn_apply_rename.setEnabled(False)
+        self.btn_cancel.setEnabled(False)
         self.btn_copy_results.setEnabled(False)
 
-        # Table for results
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.btn_load_json)
+        controls_layout.addWidget(self.btn_run_match)
+        controls_layout.addWidget(self.btn_cancel)
+        controls_layout.addWidget(self.btn_apply_rename)
+        controls_layout.addWidget(self.btn_copy_results)
+
         self.table = QTableWidget()
         self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels([
-            "Base Addr", "Base Name", "Target Addr", "Target Name", "Match (%)"
-        ])
+        self.table.setHorizontalHeaderLabels(["Base Addr", "Base Name", "Target Addr", "Target Name", "Match (%)"])
         self.table.horizontalHeader().setStretchLastSection(True)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
 
         self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setMinimum(0)    # from 0%
-        self.threshold_slider.setMaximum(100)  # to 100%
-        self.threshold_slider.setValue(65)     # default 65%
+        self.threshold_slider.setMinimum(0)
+        self.threshold_slider.setMaximum(100)
+        self.threshold_slider.setValue(65)
         self.threshold_slider.setTickInterval(5)
         self.threshold_slider.setTickPosition(QSlider.TicksBelow)
         self.threshold_label = QLabel("Threshold: 0.65")
 
-        self.threshold_slider.valueChanged.connect(self.update_threshold_label)
+        threshold_layout = QHBoxLayout()
+        threshold_layout.addWidget(QLabel("Match Threshold:"))
+        threshold_layout.addWidget(self.threshold_slider)
+        threshold_layout.addWidget(self.threshold_label)
 
-        # Layouts
-        h_layout_controls_top = QHBoxLayout()
-        h_layout_controls_top.addWidget(self.btn_export_base_json)
-        h_layout_controls_top.addWidget(self.btn_load_target_json)
-        h_layout_controls_top.addWidget(self.btn_run_match)
-        h_layout_controls_top.addWidget(self.btn_cancel)
-        h_layout_controls_top.addWidget(self.btn_apply_rename)
-        h_layout_controls_top.addWidget(self.btn_copy_results)
+        top_layout.addLayout(controls_layout)
+        top_layout.addLayout(threshold_layout)
+        top_layout.addWidget(self.label_base)
+        top_layout.addWidget(self.label_target)
+        top_layout.addWidget(self.status_label)
+        top_layout.addWidget(self.table)
+        top_layout.addWidget(self.progress)
 
-        h_layout_threshold = QHBoxLayout()
-        h_layout_threshold.addWidget(QLabel("Match Threshold (0.00-1.00):"))
-        h_layout_threshold.addWidget(self.threshold_slider)
-        h_layout_threshold.addWidget(self.threshold_label)
+        splitter.addWidget(top_widget)
 
-        self.layout.addLayout(h_layout_controls_top)
-        self.layout.addLayout(h_layout_threshold)
-        self.layout.addWidget(self.label_base)
-        self.layout.addWidget(self.label_target)
-        self.layout.addWidget(self.status_label)
-        self.layout.addWidget(self.table)
-        self.layout.addWidget(self.progress)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        splitter.addWidget(self.log_text)
+        splitter.setStretchFactor(0, 7)
+        splitter.setStretchFactor(1, 3)
 
-        # Connect buttons
-        self.btn_export_base_json.clicked.connect(self.export_base_to_json)
-        self.btn_load_target_json.clicked.connect(self.load_target_json)
-        self.btn_run_match.clicked.connect(self.run_match)
-        self.btn_cancel.clicked.connect(self.cancel_match)
-        self.btn_apply_rename.clicked.connect(self.apply_rename)
+    def _connect_signals(self):
+        self.btn_load_json.clicked.connect(self.load_target_json)
+        self.btn_run_match.clicked.connect(self.run_matching)
+        self.btn_cancel.clicked.connect(self.cancel_matching)
+        self.btn_apply_rename.clicked.connect(self.apply_renaming)
         self.btn_copy_results.clicked.connect(self.copy_results_to_clipboard)
+        self.threshold_slider.valueChanged.connect(self._update_threshold_label)
 
-        self.base_funcs = None
-        self.target_funcs = None
-        self.matches = []
-
-        self.worker = None
-        self.signals = WorkerSignals()
-
-        self.signals.progress.connect(self.update_progress)
-        self.signals.status.connect(self.update_status)
-        self.signals.finished.connect(self.match_finished)
-        self.signals.error.connect(self.match_error)
-        self.signals.result.connect(self.match_result)
-
-        self.load_base_funcs()
-
-    def update_threshold_label(self, val):
+    def _update_threshold_label(self, val):
         self.threshold_label.setText(f"Threshold: {val / 100:.2f}")
 
-    def clean_and_demangle_name(self, name: str) -> str:
-        if not name or name == "-":
-            return name
-        name = name.strip("_")
-        name = re.sub(r'__+', '::', name)
-        name = re.sub(r'(_(int|void|float|char|double|long|short|unsigned|signed))+', '', name)
-        if '(' not in name and '::' in name:
-            name += "(void)"
-        demangled = ida_name.demangle_name(name, ida_name.MNG_LONG_FORM)
-        if demangled:
-            return demangled
-        fallback = re.sub(r'_(void|int|float|char|double|long|short|unsigned|signed)$', '', name)
-        if '::' in fallback and '(' not in fallback:
-            fallback += "(void)"
-        return fallback
-
-    def load_base_funcs(self):
-        self.label_base.setText("Base: Loading current IDA functions...")
-        self.base_funcs = self.get_functions_hashes()
-        self.label_base.setText(f"Base: Loaded {len(self.base_funcs)} functions.")
-
-    def get_functions_hashes(self):
+    def load_base_functions(self):
+        self.status_label.setText("Loading base functions from IDA database...")
+        self.log("Loading base functions from IDA database...")
         funcs = {}
         for i in range(ida_funcs.get_func_qty()):
             f = ida_funcs.getn_func(i)
             if not f:
                 continue
             start = f.start_ea
-            end = f.end_ea
-            size = end - start
+            size = f.end_ea - start
             if size <= 0:
                 continue
-            func_bytes = ida_bytes.get_bytes(start, size)
-            if not func_bytes:
+            bytes_ = ida_bytes.get_bytes(start, size)
+            if not bytes_:
                 continue
-            h = hashlib.md5(func_bytes).hexdigest()
             name = ida_funcs.get_func_name(start)
-            funcs[start] = {"name": name, "hash": h}
-        return funcs
-
-    def export_base_to_json(self):
-        if not self.base_funcs:
-            QMessageBox.warning(self.parent, "Warning", "No base functions loaded to export.")
-            return
-        # Inform user about scope of export
-        QMessageBox.information(
-            self.parent,
-            "Export Info",
-            "Exported JSON is mainly useful for v36 libs or others with debug symbols."
-        )
-        funcs_list = []
-        for addr, data in self.base_funcs.items():
-            funcs_list.append({
-                "address": addr,
-                "name": data["name"],
-                "hash": data["hash"]
-            })
-        path, _ = QFileDialog.getSaveFileName(
-            self.parent, "Save Base Functions JSON", "base_functions.json", "JSON files (*.json)"
-        )
-        if path:
-            try:
-                with open(path, "w") as f_out:
-                    json.dump(funcs_list, f_out, indent=2)
-                QMessageBox.information(self.parent, "Export Success", f"Exported {len(funcs_list)} functions to JSON.")
-            except Exception as e:
-                QMessageBox.critical(self.parent, "Export Error", f"Failed to export JSON:\n{e}")
+            funcs[start] = {"name": name, "bytes": bytes_}
+        self.base_funcs = funcs
+        self.label_base.setText(f"Base: Loaded {len(funcs)} functions from IDA")
+        self.status_label.setText("Base loaded")
+        self.log(f"Loaded {len(funcs)} base functions.")
 
     def load_target_json(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self.parent, "Select Target JSON Functions File", "", "JSON files (*.json)"
-        )
+        path, _ = QFileDialog.getOpenFileName(self.parent, "Open Target JSON", "", "JSON Files (*.json)")
         if not path:
-            QMessageBox.information(self.parent, "Info", "Target JSON loading canceled.")
+            self.status_label.setText("Target JSON loading cancelled")
+            self.log("Target JSON loading cancelled by user.")
             return
 
         try:
             with open(path, "r") as f:
                 data = json.load(f)
             funcs = {}
-            for entry in data:
-                addr = entry.get("address")
-                name = entry.get("name", "-")
-                hash_ = entry.get("hash", "")
-                if addr is not None:
-                    funcs[addr] = {"name": name, "hash": hash_}
+            for addr_str, val in data.items():
+                addr = int(addr_str, 16) if addr_str.startswith("0x") else int(addr_str)
+                if "bytes" not in val:
+                    self.log(f"Target function at {addr_str} missing 'bytes', skipping")
+                    continue
+                bytes_raw = binascii.unhexlify(val["bytes"])
+                funcs[addr] = {"name": val.get("name", ""), "bytes": bytes_raw}
             self.target_funcs = funcs
-            self.label_target.setText(f"Target: Loaded {len(funcs)} functions from JSON.")
-            self.btn_apply_rename.setEnabled(False)
-            self.clear_table()
-            self.status_label.setText("Status: Target JSON loaded, ready to match.")
+            self.label_target.setText(f"Target: Loaded {len(funcs)} functions from JSON")
+            self.status_label.setText("Target loaded")
+            self.log(f"Loaded {len(funcs)} target functions from JSON: {path}")
         except Exception as e:
-            QMessageBox.critical(self.parent, "Error", f"Failed to load target JSON:\n{e}")
+            QMessageBox.warning(self.parent, "Error", f"Failed to load JSON: {e}")
+            self.status_label.setText("Error loading target JSON")
+            self.log(f"Error loading target JSON: {e}")
 
-    def clear_table(self):
-        self.table.clearContents()
-        self.table.setRowCount(0)
-        self.matches = []
-        self.btn_copy_results.setEnabled(False)
-
-    def run_match(self):
+    def run_matching(self):
         if self.worker and self.worker.is_alive():
-            QMessageBox.warning(self.parent, "Warning", "Matching already running.")
+            QMessageBox.warning(self.parent, "Warning", "Matching already running")
             return
 
-        if not self.base_funcs or not self.target_funcs:
-            QMessageBox.warning(self.parent, "Warning", "Load base and target functions first.")
+        if not self.base_funcs:
+            QMessageBox.warning(self.parent, "Warning", "Base functions not loaded")
+            self.log("Attempted to run matching but base functions not loaded.")
             return
 
-        self.clear_table()
+        if not self.target_funcs:
+            QMessageBox.warning(self.parent, "Warning", "Load target JSON first")
+            self.log("Attempted to run matching but target JSON not loaded.")
+            return
+
+        self.matches = []
+        self.table.setRowCount(0)
         self.progress.setVisible(True)
         self.progress.setMaximum(len(self.base_funcs))
         self.progress.setValue(0)
-        self.status_label.setText("Status: Starting matching...")
+        self.status_label.setText("Starting matching...")
+        self.log("Starting matching process...")
 
         threshold = self.threshold_slider.value() / 100.0
 
@@ -312,102 +295,139 @@ class SCREForm(ida_kernwin.PluginForm):
         self.btn_apply_rename.setEnabled(False)
         self.btn_copy_results.setEnabled(False)
 
-    def cancel_match(self):
+    def cancel_matching(self):
         if self.worker:
             self.worker.stop()
-            self.status_label.setText("Status: Canceling...")
+            self.status_label.setText("Cancelling matching...")
+            self.log("Matching cancellation requested.")
 
-    def update_progress(self, value):
-        self.progress.setValue(value)
+    def _on_progress(self, val):
+        self.progress.setValue(val)
 
-    def update_status(self, text):
-        self.status_label.setText(f"Status: {text}")
+    def _on_status(self, text):
+        self.status_label.setText(text)
+        self.log(text)
 
-    def match_finished(self):
+    def _on_finished(self):
         self.btn_run_match.setEnabled(True)
         self.btn_cancel.setEnabled(False)
+        self.progress.setVisible(False)
+        self.status_label.setText("Matching finished")
+        self.log("Matching finished.")
 
-    def match_error(self, error_msg):
-        QMessageBox.critical(self.parent, "Matching Error", error_msg)
+    def _on_error(self, msg):
+        QMessageBox.warning(self.parent, "Error", msg)
+        self.status_label.setText("Error occurred")
         self.btn_run_match.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        self.status_label.setText("Status: error")
+        self.btn_copy_results.setEnabled(False)
+        self.log(f"Error: {msg}")
 
-    def match_result(self, matches):
+    def _on_result(self, matches):
         self.matches = matches
         self.table.setRowCount(len(matches))
+
         for i, (b_addr, b_name, t_addr, t_name, score) in enumerate(matches):
-            addr_base_str = hex(b_addr) if isinstance(b_addr, int) else str(b_addr)
-            addr_target_str = hex(t_addr) if (isinstance(t_addr, int) and t_addr != "-") else str(t_addr)
+            b_addr_str = f"0x{b_addr:x}" if isinstance(b_addr, int) else ""
+            t_addr_str = f"0x{t_addr:x}" if isinstance(t_addr, int) else ""
 
-            b_name_clean = self.clean_and_demangle_name(b_name)
-            t_name_clean = self.clean_and_demangle_name(t_name)
-
-            self.table.setItem(i, 0, QTableWidgetItem(addr_base_str))
-            self.table.setItem(i, 1, QTableWidgetItem(b_name_clean))
-            self.table.setItem(i, 2, QTableWidgetItem(addr_target_str))
-            self.table.setItem(i, 3, QTableWidgetItem(t_name_clean))
-            item_score = QTableWidgetItem(f"{score:.2f}")
-            item_score.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(i, 4, item_score)
+            self.table.setItem(i, 0, QTableWidgetItem(b_addr_str))
+            self.table.setItem(i, 1, QTableWidgetItem(b_name))
+            self.table.setItem(i, 2, QTableWidgetItem(t_addr_str))
+            self.table.setItem(i, 3, QTableWidgetItem(t_name or ""))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{score:.2f}"))
 
         self.btn_apply_rename.setEnabled(True)
         self.btn_copy_results.setEnabled(True)
-        self.status_label.setText(f"Status: Matching finished with {len(matches)} functions.")
-        self.progress.setVisible(False)
+        self.status_label.setText(f"Matching finished with {len(matches)} candidates")
+        self.log(f"Matching finished with {len(matches)} candidates.")
 
-    def apply_rename(self):
-        if not self.base_funcs or not self.matches:
-            QMessageBox.warning(self.parent, "Warning", "Nothing to rename.")
+    def apply_renaming(self):
+        if not self.matches:
+            QMessageBox.information(self.parent, "Info", "No matches to apply")
+            self.log("Apply renaming called but no matches available.")
             return
 
-        try:
-            count_ida = 0
-            threshold = self.threshold_slider.value() / 100.0
+        threshold = self.threshold_slider.value() / 100.0
+        renamed_count = 0
 
-            for b_addr, b_name, t_addr, t_name, score in self.matches:
-                if t_name != "-" and score >= threshold:
-                    clean_name = self.clean_and_demangle_name(t_name)
-                    try:
-                        if ida_funcs.get_func(b_addr):
-                            if ida_name.set_name(b_addr, clean_name, ida_name.SN_FORCE):
-                                count_ida += 1
-                    except Exception as e:
-                        print(f"Error renaming function at {hex(b_addr)} in IDA: {e}")
+        for b_addr, b_name, t_addr, t_name, score in self.matches:
+            self.log(f"Checking function 0x{b_addr:x}: score={score:.2f}, target name={t_name}")
 
-            QMessageBox.information(
-                self.parent,
-                "Rename Results",
-                f"Renamed {count_ida} functions in IDA."
-            )
-            self.btn_apply_rename.setEnabled(False)
-        except Exception as e:
-            QMessageBox.critical(self.parent, "Rename Error", f"Error applying renames:\n{e}")
+            if score < threshold:
+                self.log(f"Skipping 0x{b_addr:x} because score {score:.2f} < threshold {threshold:.2f}")
+                continue
+
+            if not t_name:
+                self.log(f"Skipping 0x{b_addr:x} because target name is None or empty")
+                continue
+
+            if not isinstance(b_addr, int):
+                self.log(f"Skipping entry with invalid base address: {b_addr}")
+                continue
+
+            if NULLSUB_PATTERN.match(t_name):
+                self.log(f"Skipping 0x{b_addr:x} because target name '{t_name}' matches nullsub pattern")
+                continue
+
+            if b_addr not in self.base_funcs:
+                self.log(f"Skipping 0x{b_addr:x} because base address not found in base functions")
+                continue
+
+            try:
+                current_name = ida_name.get_name(b_addr)
+                if current_name == t_name:
+                    self.log(f"Name already correct for 0x{b_addr:x}: {current_name}")
+                    continue
+
+                ida_name.set_name(b_addr, t_name, ida_name.SN_FORCE)
+                renamed_count += 1
+                self.log(f"Renamed function 0x{b_addr:x} from '{current_name}' to '{t_name}'")
+            except Exception as e:
+                self.log(f"Error renaming function 0x{b_addr:x}: {e}")
+
+        QMessageBox.information(self.parent, "Rename complete", f"Renamed {renamed_count} functions")
+        self.log(f"Renaming complete. {renamed_count} functions renamed.")
 
     def copy_results_to_clipboard(self):
         if not self.matches:
-            QMessageBox.warning(self.parent, "Warning", "No matching results to copy.")
+            QMessageBox.information(self.parent, "Info", "No match results to copy")
+            self.log("Copy results called but no matches available.")
             return
 
-        lines = ["BaseAddr\tBaseName\tTargetAddr\tTargetName\tMatch(%)"]
+        lines = []
+        header = "Base Addr\tBase Name\tTarget Addr\tTarget Name\tMatch (%)"
+        lines.append(header)
         for b_addr, b_name, t_addr, t_name, score in self.matches:
-            addr_base_str = hex(b_addr) if isinstance(b_addr, int) else str(b_addr)
-            addr_target_str = hex(t_addr) if (isinstance(t_addr, int) and t_addr != "-") else str(t_addr)
-            lines.append(f"{addr_base_str}\t{b_name}\t{addr_target_str}\t{t_name}\t{score:.2f}")
+            b_addr_str = f"0x{b_addr:x}" if isinstance(b_addr, int) else ""
+            t_addr_str = f"0x{t_addr:x}" if isinstance(t_addr, int) else ""
+            line = f"{b_addr_str}\t{b_name}\t{t_addr_str}\t{t_name or ''}\t{score:.2f}"
+            lines.append(line)
 
+        text = "\n".join(lines)
         clipboard = QApplication.clipboard()
-        clipboard.setText("\n".join(lines))
+        clipboard.setText(text)
+        QMessageBox.information(self.parent, "Copied", "Match results copied to clipboard")
+        self.log("Copied match results to clipboard.")
 
-        QMessageBox.information(self.parent, "Copied", "Matching results copied to clipboard.")
+    def _on_log(self, msg):
+        self.log_text.append(msg)
+        self.log_text.moveCursor(self.log_text.textCursor().End)
+
+    def log(self, msg):
+        self._on_log(msg)
 
     def OnClose(self, form):
         if self.worker and self.worker.is_alive():
             self.worker.stop()
+            self.log("Stopped running worker thread.")
+
+def PLUGIN_ENTRY():
+    return RenamingPlugin()
 
 def main():
-    form = SCREForm()
-    form.Show("SC:RE 3.0 - Renaming Helper")
+    plugin = RenamingPlugin()
+    plugin.Show("SC:RE - Renaming Helper")
 
 if __name__ == "__main__":
     main()
-
