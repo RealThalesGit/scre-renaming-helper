@@ -1,5 +1,8 @@
-# Tool made with ChatGPT, functions name can be strange so dont worry ;3
+# Tool made with ChatGPT, function names can be strange so don't worry ;3
+I made this tool for renaming all stripped functions (you need v36), but you don’t have to rename everything manually.
 
-I made this tool for renaming all the stripped functions (you need v36) and you dont have to rename everything
+First, generate the v36 JSON
+Secondly, Open the file called "renaming-helper.py" on IDA Pro 9.0 (tested on), press Alt+F7 or just go to File > Script File
+I recommend you setting Threshold low, because it gets more name functions, but do everything you want, now load the target json, (v36.218 from brawl stars, for example), the target json should have debug symbols, which is very useful for us, then click on the "Run Match" button to start, you can cancel it too, once you done, click on the "Apply Renaming" button, it may take a while to rename everything, once you finish it, you renamed all functions in a second!
 
-So firstly, generate the v36 sqlite (can be arm64 or armeabi-v7a) but make sure if the other versions (v13 for example) have architecture for them, if it does have, good, generate them, it will take a time, for me it took 2 hours, after you generated the sqlites, open the file "renaming-helper.py"  on ida pro, by going to "File > Script File" then you got into the script! now, select the stripped lib and symbols lib, then click on "Run Matching" it will take a while like diaphora, but when it generates, click in "Apply Rename in base"
+You can test with other sc games, if they have symbols!
